@@ -485,6 +485,8 @@ H5FD__gds_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxaddr)
         o_flags |= O_CREAT;
     if (H5F_ACC_EXCL & flags)
         o_flags |= O_EXCL;
+    if (getenv("HDF5_GDS_VFD_OPEN_DIRECT"))
+        o_flags |= O_DIRECT;
 
     /* Open the file */
     if ((fd = open(name, o_flags, H5FD_GDS_POSIX_CREATE_MODE_RW)) < 0)
