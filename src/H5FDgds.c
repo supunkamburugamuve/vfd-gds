@@ -26,6 +26,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include <unistd.h>
 #include <sys/file.h>
@@ -82,6 +83,13 @@ static htri_t ignore_disabled_file_locks_s = FAIL;
 #define OP_READ    1
 #define OP_WRITE   2
 
+/* Driver-specific file access properties */
+typedef struct H5FD_gds_fapl_t {
+    size_t mboundary;  /* Memory boundary for alignment */
+    size_t fbsize;     /* File system block size */
+    size_t cbsize;     /* Maximal buffer size for copying user data */
+} H5FD_gds_fapl_t;
+
 /* POSIX I/O mode used as the third parameter to open/_open
  * when creating a new file (O_CREAT is set).
  */
@@ -104,13 +112,15 @@ static htri_t ignore_disabled_file_locks_s = FAIL;
  * occurs), and `op' will be set to H5F_OP_UNKNOWN.
  */
 typedef struct H5FD_gds_t {
-    H5FD_t          pub; /*public stuff, must be first  */
-    int             fd;  /*the unix file      */
-    haddr_t         eoa; /*end of allocated region  */
-    haddr_t         eof; /*end of file; current file size*/
-    hbool_t         ignore_disabled_file_locks;
+    H5FD_t           pub; /*public stuff, must be first  */
+    int              fd;  /*the unix file      */
+    haddr_t          eoa; /*end of allocated region  */
+    haddr_t          eof; /*end of file; current file size*/
+    hbool_t          ignore_disabled_file_locks;
 
-    CUfileHandle_t cf_handle;      /* cufile handle */
+    CUfileHandle_t   cf_handle;      /* cufile handle */
+    hbool_t          o_direct_enabled; /* TRUE if O_DIRECT was used when opening */
+    H5FD_gds_fapl_t  fa;             /* File access properties */
 
 #ifndef H5_HAVE_WIN32_API
     /*
@@ -181,6 +191,11 @@ typedef struct H5FD_gds_t {
     }
 
 /* Prototypes */
+static hbool_t H5FD__gds_parse_boolean_env(const char *env_name, hbool_t default_value);
+static herr_t  H5FD__gds_populate_config(size_t boundary, size_t block_size, size_t cbuf_size,
+                                          H5FD_gds_fapl_t *fa_out);
+static void   *H5FD__gds_fapl_get(H5FD_t *file);
+static void   *H5FD__gds_fapl_copy(const void *_old_fa);
 static hid_t   H5FD_gds_init(void);
 static herr_t  H5FD__gds_term(void);
 static H5FD_t *H5FD__gds_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxaddr);
@@ -213,9 +228,9 @@ static const H5FD_class_t H5FD_gds_g = {
     NULL,                    /* sb_size              */
     NULL,                    /* sb_encode            */
     NULL,                    /* sb_decode            */
-    0,                       /* fapl_size            */
-    NULL,                    /* fapl_get             */
-    NULL,                    /* fapl_copy            */
+    sizeof(H5FD_gds_fapl_t), /* fapl_size            */
+    H5FD__gds_fapl_get,      /* fapl_get             */
+    H5FD__gds_fapl_copy,     /* fapl_copy            */
     NULL,                    /* fapl_free            */
     0,                       /* dxpl_size            */
     NULL,                    /* dxpl_copy            */
@@ -369,6 +384,102 @@ done:
 } /* end H5FD__gds_term() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5FD__gds_populate_config
+ *
+ * Purpose:     Populates a H5FD_gds_fapl_t structure with the provided
+ *              values, supplying defaults where values are not provided.
+ *
+ * Return:      Non-negative on success/Negative on failure
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5FD__gds_populate_config(size_t boundary, size_t block_size, size_t cbuf_size, H5FD_gds_fapl_t *fa_out)
+{
+    herr_t ret_value = SUCCEED;
+
+    assert(fa_out);
+
+    memset(fa_out, 0, sizeof(H5FD_gds_fapl_t));
+
+    if (boundary != 0)
+        fa_out->mboundary = boundary;
+    else
+        fa_out->mboundary = H5FD_GDS_MBOUNDARY_DEF;
+
+    if (block_size != 0)
+        fa_out->fbsize = block_size;
+    else
+        fa_out->fbsize = H5FD_GDS_FBSIZE_DEF;
+
+    if (cbuf_size != 0)
+        fa_out->cbsize = cbuf_size;
+    else
+        fa_out->cbsize = H5FD_GDS_CBSIZE_DEF;
+
+    /* Copy buffer size must be a multiple of file block size */
+    if (fa_out->cbsize % fa_out->fbsize != 0) {
+        ret_value = FAIL;
+        goto done;
+    }
+
+done:
+    return ret_value;
+} /* end H5FD__gds_populate_config() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5FD__gds_fapl_get
+ *
+ * Purpose:     Returns a file access property list which indicates how the
+ *              specified file is being accessed. The return list could be
+ *              used to access another file the same way.
+ *
+ * Return:      Success:  Ptr to new file access property list with all
+ *                        members copied from the file struct.
+ *
+ *              Failure:  NULL
+ *
+ *-------------------------------------------------------------------------
+ */
+static void *
+H5FD__gds_fapl_get(H5FD_t *_file)
+{
+    H5FD_gds_t *file      = (H5FD_gds_t *)_file;
+    void       *ret_value = NULL; /* Return value */
+
+    /* Set return value */
+    ret_value = H5FD__gds_fapl_copy(&(file->fa));
+
+    return ret_value;
+} /* end H5FD__gds_fapl_get() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5FD__gds_fapl_copy
+ *
+ * Purpose:     Copies the gds-specific file access properties.
+ *
+ * Return:      Success:  Ptr to a new property list
+ *
+ *              Failure:  NULL
+ *
+ *-------------------------------------------------------------------------
+ */
+static void *
+H5FD__gds_fapl_copy(const void *_old_fa)
+{
+    const H5FD_gds_fapl_t *old_fa = (const H5FD_gds_fapl_t *)_old_fa;
+    H5FD_gds_fapl_t       *new_fa = NULL;
+
+    if (NULL == (new_fa = (H5FD_gds_fapl_t *)malloc(sizeof(H5FD_gds_fapl_t))))
+        return NULL;
+
+    /* Copy the general information */
+    memcpy(new_fa, old_fa, sizeof(H5FD_gds_fapl_t));
+
+    return new_fa;
+} /* end H5FD__gds_fapl_copy() */
+
+/*-------------------------------------------------------------------------
  * Function:  H5Pset_fapl_gds
  *
  * Purpose:  Modify the file access property list to use the H5FD_GDS
@@ -382,17 +493,16 @@ done:
 herr_t
 H5Pset_fapl_gds(hid_t fapl_id, size_t boundary, size_t block_size, size_t cbuf_size)
 {
+    H5FD_gds_fapl_t fa;
     herr_t          ret_value;
-
-    /* Silence compiler */
-    (void)boundary;
-    (void)block_size;
-    (void)cbuf_size;
 
     if (H5I_GENPROP_LST != H5Iget_type(fapl_id) || TRUE != H5Pisa_class(fapl_id, H5P_FILE_ACCESS))
         H5FD_GDS_GOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a file access property list");
 
-    ret_value = H5Pset_driver(fapl_id, H5FD_GDS, NULL);
+    if (H5FD__gds_populate_config(boundary, block_size, cbuf_size, &fa) < 0)
+        H5FD_GDS_GOTO_ERROR(H5E_VFL, H5E_CANTSET, FAIL, "can't initialize driver configuration info");
+
+    ret_value = H5Pset_driver(fapl_id, H5FD_GDS, &fa);
 
 done:
     H5FD_GDS_FUNC_LEAVE_API;
@@ -414,19 +524,22 @@ herr_t
 H5Pget_fapl_gds(hid_t fapl_id, size_t *boundary /*out*/, size_t *block_size /*out*/,
                 size_t *cbuf_size /*out*/)
 {
+    const H5FD_gds_fapl_t *fa;
     herr_t                 ret_value = SUCCEED; /* Return value */
 
     if (H5I_GENPROP_LST != H5Iget_type(fapl_id) || TRUE != H5Pisa_class(fapl_id, H5P_FILE_ACCESS))
         H5FD_GDS_GOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a file access property list");
     if (H5FD_GDS != H5Pget_driver(fapl_id))
         H5FD_GDS_GOTO_ERROR(H5E_PLIST, H5E_BADVALUE, FAIL, "incorrect VFL driver");
+    if (NULL == (fa = (const H5FD_gds_fapl_t *)H5Pget_driver_info(fapl_id)))
+        H5FD_GDS_GOTO_ERROR(H5E_PLIST, H5E_BADVALUE, FAIL, "bad VFL driver info");
 
     if (boundary)
-        *boundary = 0;
+        *boundary = fa->mboundary;
     if (block_size)
-        *block_size = 0;
+        *block_size = fa->fbsize;
     if (cbuf_size)
-        *cbuf_size = 0;
+        *cbuf_size = fa->cbsize;
 
 done:
     H5FD_GDS_FUNC_LEAVE_API;
@@ -457,6 +570,7 @@ H5FD__gds_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxaddr)
     int              o_flags;
     int              fd   = (-1);
     H5FD_gds_t *     file = NULL;
+    hbool_t          o_direct_enabled = FALSE;
 #ifdef H5_HAVE_WIN32_API
     HFILE                              filehandle;
     struct _BY_HANDLE_FILE_INFORMATION fileinfo;
@@ -485,8 +599,15 @@ H5FD__gds_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxaddr)
         o_flags |= O_CREAT;
     if (H5F_ACC_EXCL & flags)
         o_flags |= O_EXCL;
-    if (getenv("HDF5_GDS_VFD_OPEN_DIRECT"))
+    
+    /* Check environment variable for O_DIRECT flag
+     * Accepts: 1, true, yes, on (case-insensitive) to enable
+     *          0, false, no, off (case-insensitive) to disable
+     * Default: disabled (FALSE) */
+    if (H5FD__gds_parse_boolean_env("HDF5_GDS_VFD_OPEN_DIRECT", FALSE)) {
         o_flags |= O_DIRECT;
+        o_direct_enabled = TRUE;
+    }
 
     /* Open the file */
     if ((fd = open(name, o_flags, H5FD_GDS_POSIX_CREATE_MODE_RW)) < 0)
@@ -516,6 +637,19 @@ H5FD__gds_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxaddr)
     if (NULL == (file = calloc(1, sizeof(H5FD_gds_t))))
         H5FD_GDS_GOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, NULL, "unable to allocate file struct");
 
+    /* Get file access properties from FAPL */
+    {
+        const H5FD_gds_fapl_t *fa = (const H5FD_gds_fapl_t *)H5Pget_driver_info(fapl_id);
+        if (fa)
+            memcpy(&(file->fa), fa, sizeof(H5FD_gds_fapl_t));
+        else {
+            /* Use default values if no FAPL provided */
+            file->fa.mboundary = H5FD_GDS_MBOUNDARY_DEF;
+            file->fa.fbsize    = H5FD_GDS_FBSIZE_DEF;
+            file->fa.cbsize    = H5FD_GDS_CBSIZE_DEF;
+        }
+    }
+
     memset((void *)&cf_descr, 0, sizeof(CUfileDescr_t));
     cf_descr.handle.fd = fd;
     cf_descr.type      = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
@@ -525,6 +659,15 @@ H5FD__gds_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxaddr)
     }
 
     file->fd = fd;
+    file->o_direct_enabled = o_direct_enabled;
+    /* Get block size from file system for alignment requirements.
+     * Override the fbsize from FAPL with actual file system block size if available */
+    if (sb.st_blksize > 0)
+        file->fa.fbsize = (size_t)sb.st_blksize;
+    /* If we couldn't get block size from filesystem and user didn't set it, use default */
+    else if (file->fa.fbsize == 0)
+        file->fa.fbsize = H5FD_GDS_FBSIZE_DEF;
+    
     /* FIXME: Possible overflow! */
     file->eof = (haddr_t)sb.st_size;
 
@@ -552,7 +695,10 @@ H5FD__gds_open(const char *name, unsigned flags, hid_t fapl_id, haddr_t maxaddr)
 
     /* Set return value */
     ret_value = (H5FD_t *)file;
-fprintf(stderr, "%s:%u - Successfully opened file w/GDS VFD\n", __func__, __LINE__);
+
+    fprintf(stderr, "Successfully opened file '%s' w/GDS VFD - O_DIRECT: %s, fbsize: %zu, cbsize: %zu, mboundary: %zu\n", 
+            name, o_direct_enabled ? "YES" : "NO", 
+            file->fa.fbsize, file->fa.cbsize, file->fa.mboundary);
 
 done:
     if (ret_value == NULL) {
@@ -816,6 +962,46 @@ is_device_pointer(const void *ptr)
 }
 
 /*-------------------------------------------------------------------------
+ * Function:    H5FD__gds_parse_boolean_env
+ *
+ * Purpose:     Parse a boolean environment variable.
+ *              Accepts: "1", "true", "yes", "on" (case-insensitive) as TRUE
+ *                       "0", "false", "no", "off" (case-insensitive) as FALSE
+ *              If variable not set or empty, returns default_value.
+ *
+ * Return:      Boolean value
+ *
+ *-------------------------------------------------------------------------
+ */
+static hbool_t
+H5FD__gds_parse_boolean_env(const char *env_name, hbool_t default_value)
+{
+    const char *env_val = getenv(env_name);
+    
+    if (!env_val || env_val[0] == '\0')
+        return default_value;
+    
+    /* Check for true values */
+    if (strcmp(env_val, "1") == 0 ||
+        strcasecmp(env_val, "true") == 0 ||
+        strcasecmp(env_val, "yes") == 0 ||
+        strcasecmp(env_val, "on") == 0)
+        return TRUE;
+    
+    /* Check for false values */
+    if (strcmp(env_val, "0") == 0 ||
+        strcasecmp(env_val, "false") == 0 ||
+        strcasecmp(env_val, "no") == 0 ||
+        strcasecmp(env_val, "off") == 0)
+        return FALSE;
+    
+    /* Unrecognized value - use default and warn */
+    fprintf(stderr, "Warning: Unrecognized value '%s' for %s, using default (%s)\n",
+            env_val, env_name, default_value ? "true" : "false");
+    return default_value;
+}
+
+/*-------------------------------------------------------------------------
  * Function:  H5FD__gds_read
  *
  * Purpose:
@@ -841,9 +1027,18 @@ static herr_t
 H5FD__gds_read(H5FD_t *_file, H5FD_mem_t type, hid_t dxpl_id, haddr_t addr,
                size_t size, void *buf /*out*/)
 {
-    H5FD_gds_t *file = (H5FD_gds_t *)_file;
-    off_t offset = (off_t)addr;
-    herr_t      ret_value   = SUCCEED; /* Return value */
+    H5FD_gds_t *file       = (H5FD_gds_t *)_file;
+    herr_t      ret_value  = SUCCEED; /* Return value */
+    size_t      _fbsize;              /* File system block size */
+    size_t      _cbsize;              /* Copy buffer size */
+    size_t      alloc_size;           /* Size to allocate for copy buffer */
+    void       *copy_buf   = NULL;    /* Copy buffer for unaligned I/O */
+    size_t      copy_size;            /* Size remaining to read when using copy buffer */
+    size_t      copy_offset;          /* Offset into copy buffer of the requested data */
+    haddr_t     read_size;            /* Size to read into copy buffer */
+    haddr_t     read_addr;            /* Current read address */
+    ssize_t     nbytes;               /* Bytes returned from cuFileRead */
+    hbool_t     buf_on_device;        /* Whether user buffer is on GPU */
 
     assert(file && file->pub.cls);
     assert(buf);
@@ -858,14 +1053,141 @@ H5FD__gds_read(H5FD_t *_file, H5FD_mem_t type, hid_t dxpl_id, haddr_t addr,
     if (REGION_OVERFLOW(addr, size))
         H5FD_GDS_GOTO_ERROR(H5E_ARGS, H5E_OVERFLOW, FAIL, "addr overflow");
 
-    /* Pass to cuFile */
-    if (cuFileRead(file->cf_handle, buf, size, offset, 0) < 0)
-	H5FD_GDS_GOTO_ERROR(H5E_ARGS, H5E_OVERFLOW, FAIL,
-		"file read failed: file descriptor = %d, "
-		"buf = %p, total read size = %zu, offset = %llu",
-		file->fd, buf, size, (unsigned long long)offset);
+    /* Get the file system block size and copy buffer size */
+    _fbsize = file->fa.fbsize;
+    _cbsize = file->fa.cbsize;
+
+    /* Determine if user buffer is on device */
+    buf_on_device = is_device_pointer(buf);
+
+    /*
+     * If O_DIRECT is not enabled, no alignment handling is needed.
+     * Read directly using cuFileRead.
+     */
+    if (!file->o_direct_enabled) {
+        nbytes = cuFileRead(file->cf_handle, buf, size, (off_t)addr, 0);
+        if (nbytes < 0)
+            H5FD_GDS_GOTO_ERROR(H5E_IO, H5E_READERROR, FAIL,
+                "file read failed: fd=%d, buf=%p, size=%zu, offset=%llu",
+                file->fd, buf, size, (unsigned long long)addr);
+        goto done;
+    }
+
+    /*
+     * O_DIRECT is enabled - handle alignment requirements.
+     * Similar to HDF5 Direct VFD: if the data is aligned, read directly.
+     * If not, read into an aligned buffer first, then copy to user buffer.
+     */
+
+    /* Check if address, size, and buffer are all properly aligned */
+    if ((addr % _fbsize == 0) && (size % _fbsize == 0)) {
+        /* Fully aligned read - pass directly to cuFileRead */
+        nbytes = cuFileRead(file->cf_handle, buf, size, (off_t)addr, 0);
+        if (nbytes < 0)
+            H5FD_GDS_GOTO_ERROR(H5E_IO, H5E_READERROR, FAIL,
+                "file read failed: fd=%d, buf=%p, size=%zu, offset=%llu",
+                file->fd, buf, size, (unsigned long long)addr);
+    }
+    else {
+        /*
+         * Unaligned read - use copy buffer approach (similar to Direct VFD).
+         * Read aligned data into a temporary buffer, then copy the needed portion.
+         */
+
+        /* Calculate where we will begin copying from the copy buffer */
+        copy_offset = (size_t)(addr % _fbsize);
+
+        /* Allocate memory for the copy buffer up to the maximal copy buffer size.
+         * Make a bigger buffer for aligned I/O if size is smaller than maximal copy buffer. */
+        alloc_size = ((copy_offset + size - 1) / _fbsize + 1) * _fbsize;
+        if (alloc_size > _cbsize)
+            alloc_size = _cbsize;
+        assert(!(alloc_size % _fbsize));
+
+        /* Allocate copy buffer in same memory space as user buffer */
+        if (buf_on_device) {
+            check_cudaruntimecall(cudaMalloc(&copy_buf, alloc_size));
+        } else {
+            check_cudaruntimecall(cudaMallocHost(&copy_buf, alloc_size));
+        }
+
+        /* Look for the aligned position for reading the data */
+        read_addr = (addr / _fbsize) * _fbsize;
+        assert(!(read_addr % _fbsize));
+
+        /*
+         * Read the aligned data in file into aligned buffer first, then copy the data
+         * into the final buffer. If the data size is bigger than maximal copy buffer
+         * size, do the reading by segment (the outer do-while loop).
+         */
+        copy_size = size;
+        do {
+            /* Calculate how much data we have to read in this iteration
+             * (including unused parts of blocks) */
+            if ((copy_size + copy_offset) < alloc_size)
+                read_size = ((copy_size + copy_offset - 1) / _fbsize + 1) * _fbsize;
+            else
+                read_size = alloc_size;
+
+            assert(!(read_size % _fbsize));
+
+            /* Read aligned data into copy buffer */
+            nbytes = cuFileRead(file->cf_handle, copy_buf, read_size, (off_t)read_addr, 0);
+            if (nbytes < 0) {
+                H5FD_GDS_GOTO_ERROR(H5E_IO, H5E_READERROR, FAIL,
+                    "file read failed: fd=%d, buf=%p, size=%llu, offset=%llu",
+                    file->fd, copy_buf, (unsigned long long)read_size, (unsigned long long)read_addr);
+            }
+
+            /* Copy the needed data from the copy buffer to the output buffer */
+            if ((copy_size + copy_offset) <= alloc_size) {
+                /* All remaining data fits in this read */
+                if (buf_on_device) {
+                    check_cudaruntimecall(cudaMemcpy(buf, (char *)copy_buf + copy_offset, 
+                                                     copy_size, cudaMemcpyDeviceToDevice));
+                } else {
+                    memcpy(buf, (char *)copy_buf + copy_offset, copy_size);
+                }
+                buf = (char *)buf + copy_size;
+                copy_size = 0;
+            }
+            else {
+                /* Need more iterations - copy what we can and continue */
+                size_t this_copy = alloc_size - copy_offset;
+                if (buf_on_device) {
+                    check_cudaruntimecall(cudaMemcpy(buf, (char *)copy_buf + copy_offset,
+                                                     this_copy, cudaMemcpyDeviceToDevice));
+                } else {
+                    memcpy(buf, (char *)copy_buf + copy_offset, this_copy);
+                }
+                buf = (char *)buf + this_copy;
+                copy_size -= this_copy;
+                read_addr += alloc_size;
+                copy_offset = 0;
+            }
+        } while (copy_size > 0);
+
+        /* Free copy buffer */
+        if (copy_buf) {
+            if (buf_on_device)
+                cudaFree(copy_buf);
+            else
+                cudaFreeHost(copy_buf);
+            copy_buf = NULL;
+        }
+    }
 
 done:
+    if (ret_value < 0) {
+        /* Free copy buffer on error */
+        if (copy_buf) {
+            if (buf_on_device)
+                cudaFree(copy_buf);
+            else
+                cudaFreeHost(copy_buf);
+        }
+    }
+
     H5FD_GDS_FUNC_LEAVE_API;
 }
 
